@@ -189,3 +189,5 @@ data/
 output/
 
 .vscode/
+
+demo.py
