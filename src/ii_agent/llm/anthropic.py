@@ -39,6 +39,7 @@ from anthropic.types.message_create_params import (
 )
 
 
+from ii_agent.llm import base
 from ii_agent.llm.base import (
     LLMClient,
     AssistantContentBlock,
@@ -78,8 +79,9 @@ class AnthropicDirectClient(LLMClient):
             )
         else:
             api_key = os.getenv("ANTHROPIC_API_KEY")
+            api_url = os.getenv("ANTHROPIC_API_URL")
             self.client = anthropic.Anthropic(
-                api_key=api_key, max_retries=1, timeout=60 * 5
+                api_key=api_key, base_url=api_url, max_retries=1, timeout=60 * 5
             )
             model_name = model_name.replace(
                 "@", "-"
@@ -140,6 +142,9 @@ class AnthropicDirectClient(LLMClient):
                         text=message.text,
                     )
                 elif str(type(message)) == str(ToolCall):
+                    print("+" * 30)
+                    print(message)
+                    print(message.tool_call_id)
                     message = cast(ToolCall, message)
                     message_content = AnthropicToolUseBlock(
                         type="tool_use",
@@ -280,10 +285,9 @@ class AnthropicDirectClient(LLMClient):
             elif str(type(message)) == str(AnthropicToolUseBlock):
                 message = cast(AnthropicToolUseBlock, message)
                 internal_messages.append(
-                    ToolCall(
-                        tool_call_id=message.id,
+                    ToolCall.create(
                         tool_name=message.name,
-                        tool_input=recursively_remove_invoke_tag(message.input),
+                        tool_input=recursively_remove_invoke_tag(message.input)
                     )
                 )
             else:

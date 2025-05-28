@@ -8,8 +8,7 @@ from anthropic.types import (
     RedactedThinkingBlock as AnthropicRedactedThinkingBlock,
 )
 from typing import Literal
-
-
+import uuid
 import logging
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -38,6 +37,15 @@ class ToolCall(DataClassJsonMixin):
     tool_call_id: str
     tool_name: str
     tool_input: Any
+
+    @classmethod
+    def create(cls, tool_name: str, tool_input: Any) -> 'ToolCall':
+        """Create a new tool call with a unique ID."""
+        return cls(
+            tool_call_id=str(uuid.uuid4()),
+            tool_name=tool_name,
+            tool_input=tool_input
+        )
 
 
 @dataclass
