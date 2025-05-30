@@ -195,7 +195,11 @@ class AgentToolManager:
         self.logger_for_agent_logs.info(f"Tool input: {tool_input}")
         result = llm_tool.run(tool_input, deepcopy(history))
 
-        tool_input_str = "\n".join([f" - {k}: {v}" for k, v in tool_input.items()])
+        # Handle both string and dictionary tool inputs
+        if isinstance(tool_input, dict):
+            tool_input_str = "\n".join([f" - {k}: {v}" for k, v in tool_input.items()])
+        else:
+            tool_input_str = str(tool_input)
 
         log_message = f"Calling tool {tool_name} with input:\n{tool_input_str}"
         if isinstance(result, str):

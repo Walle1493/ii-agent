@@ -1,19 +1,43 @@
 import os
+
 import random
 import time
-import json
 from typing import Any, Tuple, cast
-
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam, ChatCompletionMessageToolCall
-from openai.types.chat.chat_completion import ChatCompletion, Choice
-from openai.types.chat.chat_completion_message import ChatCompletionMessage
-from openai._exceptions import (
-    APIConnectionError as OpenAIAPIConnectionError,
-    InternalServerError as OpenAIInternalServerError,
-    RateLimitError as OpenAIRateLimitError,
-    APIStatusError as OpenAIStatusError,
+import anthropic
+from anthropic import (
+    NOT_GIVEN as Anthropic_NOT_GIVEN,
 )
+from anthropic import (
+    APIConnectionError as AnthropicAPIConnectionError,
+)
+from anthropic import (
+    InternalServerError as AnthropicInternalServerError,
+)
+from anthropic import (
+    RateLimitError as AnthropicRateLimitError,
+)
+from anthropic._exceptions import (
+    OverloadedError as AnthropicOverloadedError,  # pyright: ignore[reportPrivateImportUsage]
+)
+from anthropic.types import (
+    TextBlock as AnthropicTextBlock,
+    ThinkingBlock as AnthropicThinkingBlock,
+    RedactedThinkingBlock as AnthropicRedactedThinkingBlock,
+    ImageBlockParam as AnthropicImageBlockParam,
+)
+from anthropic.types import ToolParam as AnthropicToolParam
+from anthropic.types import (
+    ToolResultBlockParam as AnthropicToolResultBlockParam,
+)
+from anthropic.types import (
+    ToolUseBlock as AnthropicToolUseBlock,
+)
+from anthropic.types.message_create_params import (
+    ToolChoiceToolChoiceAny,
+    ToolChoiceToolChoiceAuto,
+    ToolChoiceToolChoiceTool,
+)
+
 
 from ii_agent.llm import base
 from ii_agent.llm.base import (
@@ -45,15 +69,23 @@ class AnthropicDirectClient(LLMClient):
         region: None | str = None,
     ):
         """Initialize the Anthropic first party client."""
-        # Now using OpenAI client instead of Anthropic
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        api_url = os.getenv("ANTHROPIC_API_URL")
-        self.client = OpenAI(
-            api_key=api_key, base_url=api_url, max_retries=1, timeout=60 * 5
-        )
-        model_name = model_name.replace(
-            "@", "-"
-        )  # Keep any existing model name transformations
+        # Disable retries since we are handling retries ourselves.
+        if (project_id is not None) and (region is not None):
+            self.client = anthropic.AnthropicVertex(
+                project_id=project_id,
+                region=region,
+                timeout=60 * 5,
+                max_retries=1,
+            )
+        else:
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            api_url = os.getenv("ANTHROPIC_API_URL")
+            self.client = anthropic.Anthropic(
+                api_key=api_key, base_url=api_url, max_retries=1, timeout=60 * 5
+            )
+            model_name = model_name.replace(
+                "@", "-"
+            )  # Quick fix for Anthropic Vertex API
         self.model_name = model_name
         self.max_retries = max_retries
         self.use_caching = use_caching
@@ -84,211 +116,193 @@ class AnthropicDirectClient(LLMClient):
             A generated response.
         """
 
-        # Convert messages to OpenAI format
-        openai_messages = []
-        
-        # Add system prompt if provided
-        if system_prompt:
-            openai_messages.append({"role": "system", "content": system_prompt})
-            
+        # Turn GeneralContentBlock into Anthropic message format
+        anthropic_messages = []
         for idx, message_list in enumerate(messages):
             role = "user" if idx % 2 == 0 else "assistant"
-            message_content = []
-            tool_calls_content = []
-            
-            # Process each message in the list
+            message_content_list = []
             for message in message_list:
+                # Check string type to avoid import issues particularly with reloads.
                 if str(type(message)) == str(TextPrompt):
                     message = cast(TextPrompt, message)
-                    message_content.append({"type": "text", "text": message.text})
+                    message_content = AnthropicTextBlock(
+                        type="text",
+                        text=message.text,
+                    )
                 elif str(type(message)) == str(ImageBlock):
                     message = cast(ImageBlock, message)
-                    message_content.append({
-                        "type": "image_url", 
-                        "image_url": {"url": message.source}
-                    })
+                    message_content = AnthropicImageBlockParam(
+                        type="image",
+                        source=message.source,
+                    )
                 elif str(type(message)) == str(TextResult):
                     message = cast(TextResult, message)
-                    message_content.append({"type": "text", "text": message.text})
+                    message_content = AnthropicTextBlock(
+                        type="text",
+                        text=message.text,
+                    )
                 elif str(type(message)) == str(ToolCall):
+                    print("+" * 30)
+                    print(message)
+                    print(message.tool_call_id)
                     message = cast(ToolCall, message)
-                    # Parse tool input - handle both string and dict formats
-                    tool_input_parsed = message.tool_input
-                    if isinstance(tool_input_parsed, str):
-                        # Try to parse string as JSON if it looks like JSON
-                        if (tool_input_parsed.strip().startswith('{') and 
-                            tool_input_parsed.strip().endswith('}')):
-                            try:
-                                tool_input_parsed = json.loads(tool_input_parsed)
-                            except json.JSONDecodeError:
-                                # Keep as string if not valid JSON
-                                pass
-                    
-                    # Format the tool call according to OpenAI's expectations
-                    if role == "assistant":
-                        # Generate a unique ID if not available
-                        tool_call_id = getattr(message, 'tool_call_id', None) or f"call_{random.randint(1000000, 9999999)}"
-                        
-                        # Format arguments as a JSON string for OpenAI
-                        if isinstance(tool_input_parsed, dict):
-                            arguments = json.dumps(tool_input_parsed)
-                        else:
-                            arguments = str(tool_input_parsed)
-                            
-                        tool_calls_content.append({
-                            "id": tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": message.tool_name,
-                                "arguments": arguments
-                            }
-                        })
-                    else:
-                        # Not normal for user to have tool calls, but we'll handle it as text
-                        tool_input_display = (
-                            json.dumps(tool_input_parsed) 
-                            if isinstance(tool_input_parsed, dict) 
-                            else str(tool_input_parsed)
-                        )
-                        message_content.append({"type": "text", "text": f"Tool call: {message.tool_name}({tool_input_display})"})
+                    message_content = AnthropicToolUseBlock(
+                        type="tool_use",
+                        id=message.tool_call_id,
+                        name=message.tool_name,
+                        input=message.tool_input,
+                    )
                 elif str(type(message)) == str(ToolFormattedResult):
                     message = cast(ToolFormattedResult, message)
-                    # Tool results in OpenAI format are sent as separate tool result messages
-                    openai_messages.append({
-                        "role": "tool",
-                        "content": message.tool_output,
-                        "tool_call_id": message.tool_call_id
-                    })
-                    continue  # Skip adding to message_content
+                    message_content = AnthropicToolResultBlockParam(
+                        type="tool_result",
+                        tool_use_id=message.tool_call_id,
+                        content=message.tool_output,
+                    )
+                elif str(type(message)) == str(AnthropicRedactedThinkingBlock):
+                    message = cast(AnthropicRedactedThinkingBlock, message)
+                    message_content = message
+                elif str(type(message)) == str(AnthropicThinkingBlock):
+                    message = cast(AnthropicThinkingBlock, message)
+                    message_content = message
+                else:
+                    print(
+                        f"Unknown message type: {type(message)}, expected one of {str(TextPrompt)}, {str(TextResult)}, {str(ToolCall)}, {str(ToolFormattedResult)}"
+                    )
+                    raise ValueError(
+                        f"Unknown message type: {type(message)}, expected one of {str(TextPrompt)}, {str(TextResult)}, {str(ToolCall)}, {str(ToolFormattedResult)}"
+                    )
+                message_content_list.append(message_content)
 
-            # Create the message with appropriate content
-            if role == "assistant" and tool_calls_content:
-                # If we have tool calls in an assistant message, format accordingly
-                msg_dict = {"role": role}
-                
-                # OpenAI requires either content or tool_calls, not both empty
-                if message_content:
-                    # Convert message_content to plain text if it's just a single text item
-                    if len(message_content) == 1 and message_content[0].get("type") == "text":
-                        msg_dict["content"] = message_content[0]["text"]
-                    else:
-                        msg_dict["content"] = message_content
+            # Anthropic supports up to 4 cache breakpoints, so we put them on the last 4 messages.
+            if self.use_caching and idx >= len(messages) - 4:
+                if isinstance(message_content_list[-1], dict):
+                    message_content_list[-1]["cache_control"] = {"type": "ephemeral"}
                 else:
-                    msg_dict["content"] = ""  # Empty string if no content
-                
-                msg_dict["tool_calls"] = tool_calls_content
-                openai_messages.append(msg_dict)
-            elif message_content:
-                # Regular message with content
-                if len(message_content) == 1 and message_content[0].get("type") == "text":
-                    # Simple text message
-                    openai_messages.append({
-                        "role": role,
-                        "content": message_content[0]["text"]
-                    })
-                else:
-                    # Complex message with multiple content parts
-                    openai_messages.append({
-                        "role": role,
-                        "content": message_content
-                    })
-        
-        # Convert tools to OpenAI format
-        openai_tools = []
-        if tools:
-            for tool in tools:
-                openai_tool = {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema
-                    }
+                    message_content_list[-1].cache_control = {"type": "ephemeral"}
+
+            anthropic_messages.append(
+                {
+                    "role": role,
+                    "content": message_content_list,
                 }
-                openai_tools.append(openai_tool)
-        
-        # Convert tool_choice to OpenAI format
-        openai_tool_choice = None
-        if tool_choice:
-            if tool_choice["type"] == "auto":
-                openai_tool_choice = "auto"
-            elif tool_choice["type"] == "any":
-                openai_tool_choice = "any"
-            elif tool_choice["type"] == "tool":
-                openai_tool_choice = {
-                    "type": "function",
-                    "function": {"name": tool_choice["name"]}
-                }
-                
+            )
+
+        if self.use_caching:
+            extra_headers = self.prompt_caching_headers
+        else:
+            extra_headers = None
+
+        # Turn tool_choice into Anthropic tool_choice format
+        if tool_choice is None:
+            tool_choice_param = Anthropic_NOT_GIVEN
+        elif tool_choice["type"] == "any":
+            tool_choice_param = ToolChoiceToolChoiceAny(type="any")
+        elif tool_choice["type"] == "auto":
+            tool_choice_param = ToolChoiceToolChoiceAuto(type="auto")
+        elif tool_choice["type"] == "tool":
+            tool_choice_param = ToolChoiceToolChoiceTool(
+                type="tool", name=tool_choice["name"]
+            )
+        else:
+            raise ValueError(f"Unknown tool_choice type: {tool_choice['type']}")
+
+        if len(tools) == 0:
+            tool_params = Anthropic_NOT_GIVEN
+        else:
+            tool_params = [
+                AnthropicToolParam(
+                    input_schema=tool.input_schema,
+                    name=tool.name,
+                    description=tool.description,
+                )
+                for tool in tools
+            ]
+
         response = None
-        
+
+        if thinking_tokens is None:
+            thinking_tokens = self.thinking_tokens
+        if thinking_tokens and thinking_tokens > 0:
+            extra_body = {
+                "thinking": {"type": "enabled", "budget_tokens": thinking_tokens}
+            }
+            temperature = 1
+            assert max_tokens >= 32_000 and thinking_tokens <= 8192, (
+                f"As a heuristic, max tokens {max_tokens} must be >= 32k and thinking tokens {thinking_tokens} must be < 8k"
+            )
+        else:
+            extra_body = None
+
         for retry in range(self.max_retries):
             try:
-                # Set up request parameters
-                request_params = {
-                    "model": self.model_name,
-                    "messages": openai_messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature
-                }
-                
-                # Add tools and tool_choice if available
-                if openai_tools:
-                    request_params["tools"] = openai_tools
-                if openai_tool_choice:
-                    request_params["tool_choice"] = openai_tool_choice
-                
-                # OpenAI doesn't support thinking tokens directly, so we'll skip that parameter
-                
-                response = self.client.chat.completions.create(**request_params)
+                response = self.client.messages.create(  # type: ignore
+                    max_tokens=max_tokens,
+                    messages=anthropic_messages,
+                    model=self.model_name,
+                    temperature=temperature,
+                    system=system_prompt or Anthropic_NOT_GIVEN,
+                    tool_choice=tool_choice_param,  # type: ignore
+                    tools=tool_params,
+                    extra_headers=extra_headers,
+                    extra_body=extra_body,
+                )
                 break
             except (
-                OpenAIAPIConnectionError,
-                OpenAIInternalServerError,
-                OpenAIRateLimitError,
-                OpenAIStatusError,
+                AnthropicAPIConnectionError,
+                AnthropicInternalServerError,
+                AnthropicRateLimitError,
+                AnthropicOverloadedError,
             ) as e:
                 if retry == self.max_retries - 1:
-                    print(f"Failed OpenAI request after {retry + 1} retries")
+                    print(f"Failed Anthropic request after {retry + 1} retries")
                     raise e
                 else:
                     print(f"Retrying LLM request: {retry + 1}/{self.max_retries}")
-                    # Sleep 12-18 seconds with jitter to avoid thundering herd
+                    # Sleep 12-18 seconds with jitter to avoid thundering herd.
                     time.sleep(15 * random.uniform(0.8, 1.2))
             except Exception as e:
                 raise e
 
-        # Convert OpenAI response back to internal format
+        # Convert messages back to internal format
         internal_messages = []
-        
         assert response is not None
-        message = response.choices[0].message
-        
-        # Process text content
-        if message.content:
-            internal_messages.append(TextResult(text=message.content))
-        
-        # Process tool calls
-        if message.tool_calls:
-            for tool_call in message.tool_calls:
-                # Create a tool call with parsed arguments
-                # Note: We store arguments as a string to maintain compatibility
-                arguments = tool_call.function.arguments
+        for message in response.content:
+            if "</invoke>" in str(message):
+                warning_msg = "\n".join(
+                    ["!" * 80, "WARNING: Unexpected 'invoke' in message", "!" * 80]
+                )
+                print(warning_msg)
+
+            if str(type(message)) == str(AnthropicTextBlock):
+                message = cast(AnthropicTextBlock, message)
+                internal_messages.append(TextResult(text=message.text))
+            elif str(type(message)) == str(AnthropicRedactedThinkingBlock):
+                internal_messages.append(message)
+            elif str(type(message)) == str(AnthropicThinkingBlock):
+                message = cast(AnthropicThinkingBlock, message)
+                internal_messages.append(message)
+            elif str(type(message)) == str(AnthropicToolUseBlock):
+                message = cast(AnthropicToolUseBlock, message)
                 internal_messages.append(
                     ToolCall.create(
-                        tool_name=tool_call.function.name,
-                        tool_input=recursively_remove_invoke_tag(arguments),
-                        tool_call_id=tool_call.id
+                        tool_name=message.name,
+                        tool_input=recursively_remove_invoke_tag(message.input)
                     )
                 )
-        
-        # Prepare message metadata
+            else:
+                raise ValueError(f"Unknown message type: {type(message)}")
+
         message_metadata = {
             "raw_response": response,
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "cache_creation_input_tokens": -1,  # OpenAI doesn't provide this
-            "cache_read_input_tokens": -1,  # OpenAI doesn't provide this
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "cache_creation_input_tokens": getattr(
+                response.usage, "cache_creation_input_tokens", -1
+            ),
+            "cache_read_input_tokens": getattr(
+                response.usage, "cache_read_input_tokens", -1
+            ),
         }
-        
+
         return internal_messages, message_metadata
